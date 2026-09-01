@@ -3,9 +3,6 @@ from src.utils.config import Config
 from pathlib import Path
 import torch
 
-
-
-
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     save_dir = Path(__file__).parent.parent / 'models'
