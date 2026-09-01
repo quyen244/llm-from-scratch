@@ -7,6 +7,6 @@ class Config:
     # training
     batch_size = 64
     lr = 3e-4
-    epochs = 3
+    epochs = 1
     log_every = 200
 

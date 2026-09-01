@@ -27,10 +27,11 @@ class CharDataset(Dataset):
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    save_dir = Path(__file__).parent.parent / 'models'
+    root =  Path(__file__).parent.parent
+    save_dir = root / 'models'
 
-    train_text = open("train.txt", "r", encoding="utf-8").read()
-    val_text = open("val.txt", "r", encoding="utf-8").read()
+    train_text = open(root.parent / 'data' / 'train.txt' , "r", encoding="utf-8").read()
+    val_text = open(root.parent / 'data' / 'val.txt', "r", encoding="utf-8").read()
 
     tokenizer = Tokenizer(corpus=train_text)  # xây vocab từ train, val DÙNG CHUNG vocab này
 
@@ -43,7 +44,7 @@ if __name__ == "__main__":
     dataloader = DataLoader(train_dataset, batch_size=Config.batch_size, shuffle=True, num_workers=2)
     val_dataloader = DataLoader(val_dataset, batch_size=Config.batch_size, shuffle=False, num_workers=2)
 
-    model = Model()
+    model = Model(device=device)
 
     model.build(vocab_size=tokenizer.vocab_size,
             d_model=Config.d_model,
@@ -51,8 +52,9 @@ if __name__ == "__main__":
             num_layers=Config.num_layers,
             block_size=Config.block_size)
 
+    print('Initialized model !')
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=Config.lr)  # sketch gốc gọi Adam() thiếu params, và tạo TRƯỚC model
+    optimizer = torch.optim.AdamW(model.model.parameters(), lr=Config.lr)  # sketch gốc gọi Adam() thiếu params, và tạo TRƯỚC model
     criterion = nn.CrossEntropyLoss(ignore_index=0)                   # sketch gốc: criterion = torch (vô nghĩa)
 
     model.train(val_dataloader=val_dataloader, dataloader=dataloader ,

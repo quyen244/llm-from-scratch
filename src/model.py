@@ -78,13 +78,13 @@ class Model:
                     block_size=block_size,
                 ).to(self.device) 
 
-    def train(self, val_dataloader , dataloader , criterion, optimizer, device , save_dir , log_every : int = 500):
+    def train(self, val_dataloader , dataloader , criterion, optimizer , save_dir , log_every : int = 500):
         self.model.train() 
 
         for epoch in range(Config.epochs):
             running_loss = 0.0
             for step, (x, y) in enumerate(dataloader):
-                x, y = x.to(device), y.to(device)
+                x, y = x.to(self.device), y.to(self.device)
 
                 optimizer.zero_grad()                                    # sketch gốc THIẾU dòng này
                 logits = self.model(x)                                        # (B,T,vocab_size)
@@ -96,7 +96,7 @@ class Model:
                 if step % log_every == 0:
                     print(f"epoch {epoch} step {step} loss {running_loss / (step + 1):.4f}")
 
-            val_loss = self.evaluate(self.model, val_dataloader, criterion, device)
+            val_loss = self.evaluate(self.model, val_dataloader, criterion, self.device)
             print(f"== epoch {epoch} xong | train loss {running_loss/len(dataloader):.4f} | val loss {val_loss:.4f} ==")
 
     @torch.no_grad()
@@ -144,7 +144,7 @@ class Model:
 
     
     @torch.no_grad()
-    def generate(self, tokenizer: Tokenizer, prompt: str, max_new_tokens: int, device,
+    def generate(self, tokenizer: Tokenizer, prompt: str, max_new_tokens: int,
                 temperature: float = 1.0, top_p: float = 0.9) -> str:
         """
         Sinh văn bản autoregressive từ 1 prompt.
@@ -154,7 +154,7 @@ class Model:
         cắt bỏ phần đuôi xác suất thấp trước khi sample.
         """
         self.model.eval()
-        ids = tokenizer.encode(prompt).unsqueeze(0).to(device)  # (1, T)
+        ids = tokenizer.encode(prompt).unsqueeze(0).to(self.device)  # (1, T)
 
         for _ in range(max_new_tokens):
             # positional embedding chỉ học tới block_size vị trí -> phải crop context nếu chuỗi dài hơn
@@ -183,7 +183,7 @@ class Model:
         return tokenizer.decode(ids[0])
 
 
-    def chat(self, tokenizer: Tokenizer, device, max_new_tokens: int = 200,
+    def chat(self, tokenizer: Tokenizer, max_new_tokens: int = 200,
             temperature: float = 0.8, top_p: float = 0.9):
         """
         Lưu ý: đây là base LM char-level train bằng next-token prediction thuần trên Shakespeare,
@@ -195,7 +195,7 @@ class Model:
             prompt = input("You: ")
             if prompt.strip().lower() == "exit":
                 break
-            output = self.generate(tokenizer, prompt, max_new_tokens, device,
+            output = self.generate(tokenizer, prompt, max_new_tokens,
                             temperature=temperature, top_p=top_p)
             continuation = output[len(prompt):]  # chỉ in phần model sinh thêm, bỏ lại prompt gốc
             print("Model:", continuation)
