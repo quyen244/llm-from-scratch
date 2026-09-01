@@ -2,13 +2,11 @@
 import torch 
 import torch.nn as nn
 from typing import Dict
-from torch.utils.data import Dataset
+from pathlib import Path
 from datetime import datetime
 from src.modules.decoder import DecoderBlock
 from src.utils.config import Config
 from src.modules.normalization import RMSNorm
-import os 
-
 
 
 class Tokenizer:
@@ -53,6 +51,21 @@ class MyModel(nn.Module):
         self.final_norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(in_features=d_model, out_features=vocab_size)  # sketch gốc để out_features=num_heads (sai)
         self.lm_head.weight = self.embedding.token_emb.weight  # weight tying (mẹo chuẩn của GPT-2/nanoGPT)
+        # Mặc định nn.Embedding init N(0,1) -> cộng với weight tying làm logits scale ~sqrt(d_model),
+        # loss ban đầu ~86 thay vì ~ln(vocab_size). Init std=0.02 kiểu GPT-2 để loss xuất phát đúng.
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.padding_idx is not None:
+                with torch.no_grad():
+                    module.weight[module.padding_idx].zero_()
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embedding(input_ids)
@@ -62,89 +75,160 @@ class MyModel(nn.Module):
         return self.lm_head(x)   # (B, T, vocab_size) - logits ở MỌI vị trí, cần cho loss (B,T)
 
 class Model:
-    def __init__(self , device):
+    def __init__(self, device):
         self.device = device
         self.model = None
-         
+        self.optimizer = None
+        self.config = None  # nhớ kiến trúc để save/load dựng lại được y hệt
 
     # sketch gốc TẠO model xong không bao giờ .to(device)
-    def build(self, vocab_size, d_model , num_heads, num_layers, block_size):
+    def build(self, vocab_size, d_model, num_heads, num_layers, block_size):
+        self.config = {
+            "vocab_size": vocab_size,
+            "d_model": d_model,
+            "num_heads": num_heads,
+            "num_layers": num_layers,
+            "block_size": block_size,
+        }
+        self.model = MyModel(**self.config).to(self.device)
+        return self.model
 
-        self.model = MyModel(
-                    vocab_size=vocab_size,
-                    d_model=d_model,
-                    num_heads=num_heads,
-                    num_layers=num_layers,
-                    block_size=block_size,
-                ).to(self.device) 
+    @staticmethod
+    def infer_config(state_dict):
+        """Suy ra kiến trúc từ state_dict (dùng cho checkpoint cũ không lưu config).
 
-    def train(self, val_dataloader , dataloader , criterion, optimizer , save_dir , log_every : int = 500):
-        self.model.train() 
+        num_heads KHÔNG suy ra được từ shape (qkv luôn là d_model*3) -> lấy từ Config.
+        """
+        vocab_size, d_model = state_dict["lm_head.weight"].shape
+        block_size = state_dict["embedding.pos_emb.weight"].shape[0]
+        num_layers = 1 + max(
+            int(k.split(".")[1]) for k in state_dict if k.startswith("decoder.")
+        )
+        return {
+            "vocab_size": int(vocab_size),
+            "d_model": int(d_model),
+            "num_heads": Config.num_heads,
+            "num_layers": num_layers,
+            "block_size": int(block_size),
+        }
 
-        for epoch in range(Config.epochs):
+    def train(self, dataloader, val_dataloader, criterion, optimizer,
+              epochs: int = None, log_every: int = None, grad_clip: float = 1.0):
+        assert self.model is not None, "Gọi build() (hoặc load()) trước khi train()"
+        self.optimizer = optimizer
+        epochs = Config.epochs if epochs is None else epochs
+        log_every = Config.log_every if log_every is None else log_every
+
+        self.model.train()
+        history = []
+
+        for epoch in range(epochs):
             running_loss = 0.0
             for step, (x, y) in enumerate(dataloader):
                 x, y = x.to(self.device), y.to(self.device)
 
-                optimizer.zero_grad()                                    # sketch gốc THIẾU dòng này
-                logits = self.model(x)                                        # (B,T,vocab_size)
-                loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+                optimizer.zero_grad(set_to_none=True)                    # sketch gốc THIẾU dòng này
+                logits = self.model(x)                                   # (B,T,vocab_size)
+                loss = criterion(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
                 loss.backward()                                          # sketch gốc THIẾU dòng này
+                if grad_clip:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
                 optimizer.step()                                         # sketch gốc THIẾU dòng này
 
                 running_loss += loss.item()
                 if step % log_every == 0:
-                    print(f"epoch {epoch} step {step} loss {running_loss / (step + 1):.4f}")
+                    print(f"epoch {epoch} step {step}/{len(dataloader)} "
+                          f"loss {running_loss / (step + 1):.4f}", flush=True)
 
-            val_loss = self.evaluate(self.model, val_dataloader, criterion, self.device)
-            print(f"== epoch {epoch} xong | train loss {running_loss/len(dataloader):.4f} | val loss {val_loss:.4f} ==")
+            train_loss = running_loss / max(len(dataloader), 1)
+            val_loss = self.evaluate(val_dataloader, criterion)
+            history.append((train_loss, val_loss))
+            print(f"== epoch {epoch} xong | train loss {train_loss:.4f} | val loss {val_loss:.4f} ==",
+                  flush=True)
+
+        return history
 
     @torch.no_grad()
-    def evaluate(model, dataloader, criterion, device):
-        model.eval()
+    def evaluate(self, dataloader, criterion):
+        if dataloader is None or len(dataloader) == 0:
+            return float("nan")
+        was_training = self.model.training
+        self.model.eval()
         total_loss = 0.0
         for x, y in dataloader:
-            x, y = x.to(device), y.to(device)
-            logits = model(x)
-            loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+            x, y = x.to(self.device), y.to(self.device)
+            logits = self.model(x)
+            loss = criterion(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
             total_loss += loss.item()
-        model.train()
+        self.model.train(was_training)
         return total_loss / len(dataloader)
 
 
-    def save(self , save_dir , optimizer = None , loss = None, tokenzer = None):
-        os.mkdir(save_dir, exist_ok = True)
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        filepath = f"model_{timestamp}.pth"
-
-        checkpoint = {
-            'model' : self.model.state_dict(),
-            'optimizer' : optimizer.state_dict(),
-            'loss' : loss,
-            'tokenzer' : tokenzer
-        }
-
-        torch.save(checkpoint, filepath)
-        print('Model saved to : ' ,filepath )
-        return filepath
-
-    def load(self, save_dir):
-        try:
-            checkpoint = torch.save(save_dir)
-            self.model = checkpoint['model']
-            print('Load model succesfully')
-            
-            return checkpoint['tokenzer']
+    def save(self, save_dir, optimizer=None, tokenizer=None):
+        # Tạo thư mục nếu chưa tồn tại
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
         
-        except Exception as e:
-            print(f"error during loading model : {e}")
+        # Tạo tên file với timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath = save_dir / f"model_{timestamp}.pth"
+        
+        # Tạo checkpoint
+        checkpoint = {
+            'model_state_dict': self.model.state_dict(),  # Lưu state_dict, không phải model
+            'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
+            'config': self.config,      # thiếu cái này thì load() không dựng lại được kiến trúc
+            'tokenizer': tokenizer,
+            'timestamp': timestamp
+        }
+        
+        # Lưu
+        torch.save(checkpoint, filepath)
+        print(f'Model saved to: {filepath}')
+        return filepath
+    
+    def load(self, save_path, map_location=None):
+        """Load checkpoint. Tự build model nếu chưa build (kiến trúc lấy từ checkpoint).
+
+        Trả về tokenizer đã lưu kèm, hoặc None nếu lỗi.
+        """
+        map_location = map_location or self.device
+        save_path = Path(save_path)
+        if not save_path.exists():
+            print(f"Error: File not found at {save_path}")
             return None
 
-    
+        checkpoint = torch.load(save_path, map_location=map_location, weights_only=False)
+        state_dict = checkpoint.get('model_state_dict') or checkpoint.get('model')
+        if state_dict is None:
+            print("Error: checkpoint không có 'model_state_dict'")
+            return None
+
+        # dựng lại kiến trúc: ưu tiên config trong checkpoint, không có thì suy từ state_dict
+        if self.model is None:
+            config = checkpoint.get('config') or self.infer_config(state_dict)
+            print(f"Building model từ checkpoint config: {config}")
+            self.build(**config)
+
+        self.model.load_state_dict(state_dict)
+        self.model.to(self.device)
+        print('Model loaded successfully')
+
+        if self.optimizer is not None and checkpoint.get('optimizer_state_dict'):
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print('Optimizer loaded successfully')
+
+        self.model.eval()  # inference mode (quan trọng!)
+
+        tokenizer = checkpoint.get('tokenizer')
+        if tokenizer is not None:
+            print(f'Tokenizer loaded successfully (vocab_size={tokenizer.vocab_size})')
+            if tokenizer.vocab_size != self.model.lm_head.out_features:
+                print("CẢNH BÁO: vocab_size của tokenizer khác với lm_head của model!")
+        return tokenizer
+
     @torch.no_grad()
-    def generate(self, tokenizer: Tokenizer, prompt: str, max_new_tokens: int,
+    def generate(self, tokenizer: Tokenizer, prompt: str, max_new_tokens: int = 200,
                 temperature: float = 1.0, top_p: float = 0.9) -> str:
         """
         Sinh văn bản autoregressive từ 1 prompt.
@@ -153,14 +237,21 @@ class Model:
         - top_p (nucleus sampling): chỉ giữ tập token nhỏ nhất có tổng xác suất >= top_p,
         cắt bỏ phần đuôi xác suất thấp trước khi sample.
         """
+        assert self.model is not None, "Gọi build() hoặc load() trước khi generate()"
         self.model.eval()
+        block_size = (self.config or {}).get("block_size", Config.block_size)
+
+        if not prompt:
+            prompt = "\n"  # model cần ít nhất 1 token để bắt đầu
         ids = tokenizer.encode(prompt).unsqueeze(0).to(self.device)  # (1, T)
+        prompt_len = ids.size(1)
 
         for _ in range(max_new_tokens):
             # positional embedding chỉ học tới block_size vị trí -> phải crop context nếu chuỗi dài hơn
-            ids_cond = ids[:, -Config.block_size:]
+            ids_cond = ids[:, -block_size:]
             logits = self.model(ids_cond)                                    # (1, T, vocab)
             logits = logits[:, -1, :] / max(temperature, 1e-6)          # chỉ cần logits ở VỊ TRÍ CUỐI
+            logits[:, 0] = float("-inf")   # id 0 = <unk>/pad, decode ra "" -> cấm sinh ra nó
 
             probs = torch.softmax(logits, dim=-1)                       # (1, vocab)
 
@@ -179,8 +270,9 @@ class Model:
 
             ids = torch.cat([ids, next_id], dim=1)
 
-        self.train.train()
-        return tokenizer.decode(ids[0])
+        # chỉ trả về phần MỚI sinh ra: cắt theo token id, không cắt theo len(prompt) của
+        # chuỗi đã decode (ký tự lạ decode thành "" -> lệch độ dài -> cắt sai)
+        return tokenizer.decode(ids[0, prompt_len:])
 
 
     def chat(self, tokenizer: Tokenizer, max_new_tokens: int = 200,
@@ -190,14 +282,18 @@ class Model:
         KHÔNG phải model đã instruction-tune -> "chat" ở đây nghĩa là đưa 1 đoạn mồi (prompt),
         model tiếp tục viết theo văn phong đã học, không phải hỏi-đáp thật.
         """
+        assert tokenizer is not None, "Không có tokenizer (load() thất bại?)"
         print(f"Gõ 'exit' để thoát. (temperature={temperature}, top_p={top_p})")
         while True:
-            prompt = input("You: ")
-            if prompt.strip().lower() == "exit":
+            try:
+                prompt = input("You: ")
+            except (EOFError, KeyboardInterrupt):
+                print()
                 break
-            output = self.generate(tokenizer, prompt, max_new_tokens,
-                            temperature=temperature, top_p=top_p)
-            continuation = output[len(prompt):]  # chỉ in phần model sinh thêm, bỏ lại prompt gốc
+            if prompt.strip().lower() in ("exit", "quit"):
+                break
+            continuation = self.generate(tokenizer, prompt, max_new_tokens,
+                                         temperature=temperature, top_p=top_p)
             print("Model:", continuation)
 
 
